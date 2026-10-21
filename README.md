@@ -60,9 +60,11 @@ Checkpoints every 2000 iterations in `logs/<run>/`; the eval watcher scores each
 | 12000 | 1.27 | 0.829 | 1 |
 | 14000 | 1.48 | 0.820 | 1 |
 | 16000 | 1.70 | 0.839 | 0 |
+| 18000 | 1.91 | 0.850 | 0 |
+| 20000 | 2.13 | 0.854 | 0 |
 
 Return 0.82 at 1.27 h (paper, Fig. 4a: within 1.2 h on one H100; Isaac Lab port: 0.824 at 1.24 h);
-return >= 0.82 with 0/40 failed at 1.70 h (Isaac Lab port: 1.47 h). Train time includes the eval
+return >= 0.82 with 0/40 failed at 1.70 h (Isaac Lab port: 1.47 h), held through 20000 iterations. Train time includes the eval
 watcher sharing the GPU (about 2.9 -> 2.0 it/s while it runs); the paper does not count evaluation.
 Training throughput: 2.9 it/s on H200, 2.6 it/s on L40S; simulator alone 222k control steps/s at
 4096 envs on L40S.

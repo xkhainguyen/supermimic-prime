@@ -12,6 +12,7 @@ import sys
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import imageio_ffmpeg
 import mujoco
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -73,7 +74,7 @@ def main():
     cam.distance, cam.azimuth, cam.elevation = 3.6, 135.0, -12.0
     font = ImageFont.load_default(size=22)
     ff = subprocess.Popen(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(a.fps),
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(a.fps),
          "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", a.out],
         stdin=subprocess.PIPE,
     )  # fmt: skip
