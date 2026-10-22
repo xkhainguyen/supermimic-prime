@@ -25,6 +25,7 @@ parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpo
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
+parser.add_argument("--contact_model", type=str, default="paper", choices=["paper", "legacy"])
 parser.add_argument("--eval_envs", type=int, default=16384, help="parallel motions; larger libraries run in length-sorted chunks")
 args = parser.parse_args()
 
@@ -135,7 +136,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     return res
 
 
-env = TrackingSim(min(C, args.eval_envs), motion, mdp, eval_mode=True, device=dev)
+env = TrackingSim(min(C, args.eval_envs), motion, mdp, eval_mode=True, device=dev, contact_model=args.contact_model)
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
     res = evaluate(env, ck, args.record)

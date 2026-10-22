@@ -40,11 +40,16 @@ class TrackingSim:
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
                  max_episode_steps: int = 500, reset_noise: bool = True, device: str = "cuda:0",
-                 sim_cfg: SimulationCfg | None = None):  # fmt: skip
+                 sim_cfg: SimulationCfg | None = None, contact_model: str = "paper", auto_reset: bool = True):  # fmt: skip
+        """contact_model "legacy" reproduces the first LAFAN1 run's contacts (see robot.LEGACY_COLLISION);
+        auto_reset False leaves finished episodes running (for paired rollouts)."""
         self.device = dev = device
-        scene_cfg = SceneCfg(num_envs=num_envs, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg()})
+        self.auto_reset = auto_reset
+        scene_cfg = SceneCfg(num_envs=num_envs, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg(contact_model)})
         self.scene = Scene(scene_cfg, device=dev)
-        self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg or make_sim_cfg(), spec=self.scene.spec, device=dev)
+        if sim_cfg is None:
+            sim_cfg = make_sim_cfg() if contact_model == "paper" else make_sim_cfg(nconmax=128, njmax=500)
+        self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, spec=self.scene.spec, device=dev)
         self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
         self.robot = self.scene["robot"]
         self.jid = torch.tensor(self.robot.find_joints(G1_JOINT_NAMES, preserve_order=True)[0], device=dev)
@@ -63,7 +68,7 @@ class TrackingSim:
 
         # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
-        local_geoms = self.robot.find_geoms(FOOT_GEOMS)[0]
+        local_geoms = self.robot.find_geoms(FOOT_GEOMS if contact_model == "paper" else ".*_collision")[0]
         self.geom_ids = idx.geom_ids[torch.tensor(local_geoms, device=dev)]
         self.torso_bid = int(idx.body_ids[self.robot.find_bodies("torso_link")[0][0]])
         # per-episode sim context (paper App. A, Table A.3), resampled in reset()
@@ -203,6 +208,8 @@ class TrackingSim:
         if self.eval_mode:
             self.failed_eval |= term & ~self.done_eval
             self.done_eval |= done
+            return out
+        if not self.auto_reset:
             return out
         ids = done.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:

@@ -20,6 +20,7 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
     get_spec,
 )
 from mjlab.entity import EntityCfg
+from mjlab.utils.spec_config import CollisionCfg
 
 MJCF_PATH = str(G1_XML)
 
@@ -48,6 +49,11 @@ DEFAULT_JOINT_POS = dict(KNEES_BENT_KEYFRAME.joint_pos)
 
 FOOT_GEOMS = r"^(left|right)_foot[1-7]_collision$"
 
+# Contact model of the first (Isaac-port-faithful) LAFAN1 run: no self-collisions, every robot geom
+# condim 3 with priority over the ground, friction context on all robot geoms. Needed to evaluate
+# world models trained under it.
+LEGACY_COLLISION = CollisionCfg(geom_names_expr=(".*_collision",), contype=0, conaffinity=1, condim=3, priority=1, friction=(0.6,))
+
 
 def _lookup(table: dict[str, float], name: str, default: float) -> float:
     val = default
@@ -65,10 +71,10 @@ def default_joint_pos_list() -> list[float]:
     return [_lookup(DEFAULT_JOINT_POS, n, 0.0) for n in G1_JOINT_NAMES]
 
 
-def g1_cfg() -> EntityCfg:
+def g1_cfg(contact_model: str = "paper") -> EntityCfg:
     return EntityCfg(
         init_state=KNEES_BENT_KEYFRAME,
-        collisions=(FULL_COLLISION,),
+        collisions=(FULL_COLLISION if contact_model == "paper" else LEGACY_COLLISION,),
         spec_fn=get_spec,
         articulation=G1_ARTICULATION,
     )
