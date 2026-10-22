@@ -33,8 +33,9 @@ parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--no_critic", action="store_true")
 parser.add_argument("--warmup_steps", type=int, default=8, help="sim steps before any update (one k-step window)")
 parser.add_argument("--wm_only_iters", type=int, default=0, help="world-model-only iterations at the start (paper: none)")
-parser.add_argument("--wm_steps", type=int, default=1, help="WM optimizer steps per iteration; the --wm_batches batches are "
-                    "split evenly among them (paper Table A.5: one step on 10 x 2048 windows per policy update)")
+parser.add_argument("--wm_steps", type=int, default=10, help="WM optimizer steps per iteration; the --wm_batches batches are "
+                    "split evenly among them (paper Table A.5: 10 batches of 2048 windows per WM update, one WM update "
+                    "per policy update)")
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
 parser.add_argument("--log_every", type=int, default=50)
