@@ -24,7 +24,7 @@ from supermimic.rotations import quat_to_mat, rot_angle_sq
 dev = "cuda:0"
 kin = G1Kinematics(dev)
 t0 = time.time()
-motion = MotionLib.from_dir(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "lafan1_g1"), kin, dev)
+motion = MotionLib.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "lafan1_g1"), kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 env = TrackingSim(args.num_envs, motion, mdp, eval_mode=True, device=dev)
@@ -45,7 +45,7 @@ bp, bR, bv, bw = kin.forward(*S)
 print("FK pos err", (bp - pose[..., :3]).norm(dim=-1).max().item())
 print("FK rot err", rot_angle_sq(bR, quat_to_mat(pose[..., 3:7])).sqrt().max().item())
 print("FK linvel err", (bv - vel[..., :3]).norm(dim=-1).max().item(), " angvel err", (bw - vel[..., 3:]).norm(dim=-1).max().item())
-print("ref body vs FK(sim) pos err", (motion.body_p[frames] - bp).norm(dim=-1).max().item())
+print("ref body vs FK(sim) pos err", (motion.bodies(frames)[0] - bp).norm(dim=-1).max().item())
 # open-loop reference playback via joint targets
 for t in range(150):
     f1 = env.f + 1

@@ -25,6 +25,7 @@ parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpo
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
+parser.add_argument("--eval_envs", type=int, default=16384, help="parallel motions; larger libraries run in length-sorted chunks")
 args = parser.parse_args()
 
 import numpy as np
@@ -41,7 +42,7 @@ from supermimic.robot import default_joint_pos_list
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
 kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+motion = MotionLib.load(args.motion_dir, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 C = len(motion.names)
 
@@ -54,36 +55,49 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
-    ids = torch.arange(C, device=dev)
-    env.done_eval[:] = False
-    env.failed_eval[:] = False
-    env.reset(ids, motion.clip_start.clone())
-    clip_end = motion.clip_end.clone()
+    N = env.N
+    assert record is None or C <= N, "--record needs every motion in one chunk"
     ret = torch.zeros(C, device=dev)
-    steps = torch.zeros(C, device=dev)
-    hist = None
+    failed = torch.zeros(C, dtype=torch.bool, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
-    while not bool(env.done_eval.all()):
-        S = env.state()
-        o = mdp.obs(S, env.a_prev, env.xi, env.f)
-        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        a = pi(hist, motion.goal(env.f, K))
-        alive = ~env.done_eval.clone()
-        if record:
-            from supermimic.rotations import mat_to_quat
+    order = torch.argsort(motion.clip_len, descending=True)
+    for c0 in range(0, C, N):
+        clips = order[c0 : c0 + N]
+        n = len(clips)
+        # spare envs replay the chunk's first motions and are ignored
+        slot = torch.arange(N, device=dev) % n
+        env.done_eval[:] = False
+        env.failed_eval[:] = False
+        env.reset(torch.arange(N, device=dev), motion.clip_start[clips[slot]])
+        env.done_eval[n:] = True
+        clip_end = motion.clip_end[clips[slot]]
+        r_sum = torch.zeros(N, device=dev)
+        hist = None
+        while not bool(env.done_eval.all()):
+            S = env.state()
+            o = mdp.obs(S, env.a_prev, env.xi, env.f)
+            hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+            a = pi(hist, motion.goal(env.f, K))
+            alive = ~env.done_eval.clone()
+            if record:
+                from supermimic.rotations import mat_to_quat
 
-            traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
-            traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
-        out = env.step(a)
-        ret += torch.where(alive, out["r"], 0.0)
-        steps += alive.float()
-        env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
+                traj["root_p"].append(S[0][:n].cpu()), traj["root_quat"].append(mat_to_quat(S[1])[:n].cpu())
+                traj["q"].append(S[4][:n].cpu()), traj["f"].append(env.f[:n].cpu()), traj["alive"].append(alive[:n].cpu())
+            out = env.step(a)
+            r_sum += torch.where(alive, out["r"], 0.0)
+            env.f = torch.minimum(env.f, clip_end - 1)  # finished motions keep stepping; keep f+1 in range
+        ret[clips] = r_sum[:n]
+        failed[clips] = env.failed_eval[:n]
+    if record:  # back to library order
+        inv = torch.argsort(order).cpu()
+        traj = {k: [x[inv] for x in v] for k, v in traj.items()}
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
         "norm_return": norm.mean().item(),
         "norm_return_framew": (ret.sum() / ((motion.clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
-        "n_failed": int(env.failed_eval.sum().item()),
-        "failed": [motion.names[i] for i in env.failed_eval.nonzero().flatten().tolist()],
+        "n_failed": int(failed.sum().item()),
+        "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
         "per_clip": {motion.names[i]: round(norm[i].item(), 4) for i in range(C)},
     }
     if record:
@@ -93,7 +107,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     return res
 
 
-env = TrackingSim(C, motion, mdp, eval_mode=True, device=dev)
+env = TrackingSim(min(C, args.eval_envs), motion, mdp, eval_mode=True, device=dev)
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
     res = evaluate(env, ck, args.record)
@@ -114,7 +128,7 @@ while True:
         ck = torch.load(c, map_location=dev)
         t0 = time.time()
         res = evaluate(env, ck)
-        line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"
+        line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'][:50])}\n"
         open(out_csv, "a").write(line)
         json.dump(res, open(c.replace(".pt", "_eval.json"), "w"), indent=1)
         print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C} ({time.time() - t0:.0f}s)", flush=True)

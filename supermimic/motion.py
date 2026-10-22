@@ -1,4 +1,10 @@
-"""Reference motion library: LAFAN1 G1 retargets resampled to 50 Hz, with FK of tracked bodies."""
+"""Reference motion library at 50 Hz with FK of tracked bodies.
+
+Two sources: LAFAN1 G1 retarget CSVs (30 fps, resampled here) and a packed 50 Hz library
+(tools/prepare_bones.py; root_p, root_quat, q, clip_len). Tracked-body poses and velocities are
+precomputed for small libraries and computed by FK on demand for large ones (BONES-SEED: 47.6M
+frames, where precomputed bodies would take ~55 GB).
+"""
 
 from __future__ import annotations
 
@@ -13,84 +19,104 @@ from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+PRECOMPUTE_BODIES_MAX_FRAMES = 2_000_000
+CHUNK = 1 << 20
 
 
 class MotionLib:
-    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0):
-        self.device = device
-        self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-        ps, qs, js = [], [], []
-        lens = []
+    def __init__(self, names: list[str], lens: list[int], root_p: torch.Tensor, root_quat: torch.Tensor, q: torch.Tensor,
+                 kin: G1Kinematics, device: str):  # fmt: skip
+        """root_p (F,3), root_quat (F,4) wxyz, q (F,29) at 50 Hz, clips concatenated in ``names`` order."""
+        self.device, self.kin, self.names = device, kin, names
+        self.clip_len = torch.as_tensor(lens, device=device)
+        self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long, device=device), self.clip_len[:-1])), 0)
+        self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
+        self.num_frames = int(self.clip_len.sum())
+        self.clip_id = torch.repeat_interleave(torch.arange(len(lens), device=device), self.clip_len)
+        F_ = self.num_frames
+        self.root_p, self.q = root_p.to(device), q.to(device)
+        self.root_R = torch.empty(F_, 3, 3, device=device)
+        for s in range(0, F_, CHUNK):
+            self.root_R[s : s + CHUNK] = quat_to_mat(root_quat[s : s + CHUNK].to(device))
+        # finite differences inside each clip: central, one-sided at the clip boundaries
+        idx = torch.arange(F_, device=device)
+        first = idx == self.clip_start[self.clip_id]
+        last = idx == self.clip_end[self.clip_id]
+        nxt = torch.where(last, idx, idx + 1)
+        prv = torch.where(first, idx, idx - 1)
+        dt = ((nxt - prv).float() * CONTROL_DT).clamp(min=CONTROL_DT)
+        self.root_v = (self.root_p[nxt] - self.root_p[prv]) / dt[:, None]
+        self.qd = (self.q[nxt] - self.q[prv]) / dt[:, None]
+        self.root_w = torch.empty(F_, 3, device=device)
+        for s in range(0, F_, CHUNK):
+            n_, p_ = nxt[s : s + CHUNK], prv[s : s + CHUNK]
+            self.root_w[s : s + CHUNK] = so3_log(self.root_R[n_] @ self.root_R[p_].transpose(-1, -2)) / dt[s : s + CHUNK, None]
+        del idx, first, last, nxt, prv, dt
+        Rt = self.root_R.transpose(-1, -2)
+        self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
+        self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        self.root_gz = self.root_R[:, 2, 2]
+        self._bodies = None
+        if F_ <= PRECOMPUTE_BODIES_MAX_FRAMES:
+            with torch.no_grad():
+                out = [self._fk(torch.arange(s, min(s + 65536, F_), device=device)) for s in range(0, F_, 65536)]
+            self._bodies = tuple(torch.cat([o[i] for o in out]) for i in range(4))
+        # 1 s bins
+        nb = torch.div(self.clip_len + BIN_FRAMES - 1, BIN_FRAMES, rounding_mode="floor")
+        self.bin_clip = torch.repeat_interleave(torch.arange(len(lens), device=device), nb)
+        bin_off = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long, device=device), nb[:-1])), 0)
+        local_bin = torch.arange(len(self.bin_clip), device=device) - bin_off[self.bin_clip]
+        self.bin_start = self.clip_start[self.bin_clip] + local_bin * BIN_FRAMES
+        self.num_bins = len(self.bin_start)
+        local_frame = torch.arange(F_, device=device) - self.clip_start[self.clip_id]
+        self.frame_bin = bin_off[self.clip_id] + torch.div(local_frame, BIN_FRAMES, rounding_mode="floor")
+
+    def _fk(self, f: torch.Tensor):
+        return self.kin.forward(self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f])
+
+    def bodies(self, f: torch.Tensor):
+        """Tracked-body world positions, rotations, linear and angular velocities of reference frames f."""
+        if self._bodies is not None:
+            return tuple(x[f] for x in self._bodies)
+        return self._fk(f)
+
+    # ------------------------------------------------------------------ sources
+    @staticmethod
+    def from_dir(path: str, kin: G1Kinematics, device: str, src_fps: float = 30.0) -> MotionLib:
+        """LAFAN1 G1 retarget CSVs (root pos, root quat xyzw, 29 joints) resampled to 50 Hz."""
+        files = sorted(glob.glob(os.path.join(path, "*.csv")))
+        names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+        ps, qs, js, lens = [], [], [], []
         for f in files:
             raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
             p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
             quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
-            # resample to 50 Hz
             T_src = raw.shape[0]
-            dur = (T_src - 1) / src_fps
-            n = int(np.floor(dur / CONTROL_DT)) + 1
+            n = int(np.floor((T_src - 1) / src_fps / CONTROL_DT)) + 1
             t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
             i0 = torch.clamp(t.floor().long(), max=T_src - 2)
             a = (t - i0.float()).clamp(0, 1)
-            p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
-            j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
-            quat = quat_slerp(quat[i0], quat[i0 + 1], a)
-            ps.append(p), qs.append(quat), js.append(j)
+            ps.append(p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None])
+            js.append(j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None])
+            qs.append(quat_slerp(quat[i0], quat[i0 + 1], a))
             lens.append(n)
-        self.clip_len = torch.tensor(lens, device=device)
-        self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1]))), 0).to(device)
-        self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
-        self.num_frames = int(sum(lens))
-        self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
-
-        root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
-        for p, quat, j in zip(ps, qs, js):
-            R = quat_to_mat(quat)
-            v = _gradient(p, CONTROL_DT)
-            qd = _gradient(j, CONTROL_DT)
-            # angular velocity (world) by central differences of rotations
-            w = torch.zeros_like(p)
-            w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
-            w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
-            w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
-            root_p.append(p), root_R.append(R), root_v.append(v), root_w.append(w), jq.append(j), jqd.append(qd)
-        cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
-        self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
-        self.q, self.qd = cat(jq), cat(jqd)
-        with torch.no_grad():
-            bp, bR, bv, bw = [], [], [], []
-            for s in range(0, self.num_frames, 65536):
-                e = min(s + 65536, self.num_frames)
-                out = kin.forward(self.root_p[s:e], self.root_R[s:e], self.root_v[s:e], self.root_w[s:e], self.q[s:e], self.qd[s:e])
-                bp.append(out[0]), bR.append(out[1]), bv.append(out[2]), bw.append(out[3])
-            self.body_p, self.body_R, self.body_v, self.body_w = torch.cat(bp), torch.cat(bR), torch.cat(bv), torch.cat(bw)
-        # per-frame static goal parts: q, qd, root velocities in the root frame
-        Rt = self.root_R.transpose(-1, -2)
-        self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
-        self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
-        self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
-        # 1 s bins
-        bin_clip, bin_start = [], []
-        for c in range(len(lens)):
-            nb = int(np.ceil(lens[c] / BIN_FRAMES))
-            for b in range(nb):
-                bin_clip.append(c)
-                bin_start.append(int(self.clip_start[c]) + b * BIN_FRAMES)
-        self.bin_clip = torch.tensor(bin_clip, device=device)
-        self.bin_start = torch.tensor(bin_start, device=device)
-        self.num_bins = len(bin_start)
-        self.frame_bin = torch.zeros(self.num_frames, dtype=torch.long, device=device)
-        for b in range(self.num_bins):
-            c = bin_clip[b]
-            s = bin_start[b]
-            e = min(s + BIN_FRAMES, int(self.clip_end[c]) + 1)
-            self.frame_bin[s:e] = b
+        return MotionLib(names, lens, torch.cat(ps), torch.cat(qs), torch.cat(js), kin, device)
 
     @staticmethod
-    def from_dir(path: str, kin: G1Kinematics, device: str) -> MotionLib:
-        files = sorted(glob.glob(os.path.join(path, "*.csv")))
-        return MotionLib(files, kin, device)
+    def from_packed(path: str, kin: G1Kinematics, device: str) -> MotionLib:
+        """Packed 50 Hz library written by tools/prepare_bones.py."""
+        load = lambda n: torch.from_numpy(np.load(os.path.join(path, n)))  # noqa: E731
+        names = open(os.path.join(path, "names.txt")).read().split()
+        lens = np.load(os.path.join(path, "clip_len.npy")).tolist()
+        return MotionLib(names, lens, load("root_p.npy"), load("root_quat.npy"), load("q.npy"), kin, device)
 
+    @staticmethod
+    def load(path: str, kin: G1Kinematics, device: str) -> MotionLib:
+        if os.path.exists(os.path.join(path, "clip_len.npy")):
+            return MotionLib.from_packed(path, kin, device)
+        return MotionLib.from_dir(path, kin, device)
+
+    # ------------------------------------------------------------------ queries
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
         """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""
         end = self.clip_end[self.clip_id[f]]
@@ -111,11 +137,3 @@ class MotionLib:
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
-
-
-def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
-    g = torch.zeros_like(x)
-    g[1:-1] = (x[2:] - x[:-2]) / (2 * dt)
-    g[0] = (x[1] - x[0]) / dt
-    g[-1] = (x[-1] - x[-2]) / dt
-    return g

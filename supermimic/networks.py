@@ -38,6 +38,13 @@ class RunningNorm(nn.Module):
             return
         n = x.shape[0]
         m, v = x.mean(0), x.var(0, unbiased=False)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # pool the batch moments of all ranks so every rank keeps identical statistics
+            mom = torch.cat((torch.tensor([float(n)], device=x.device), x.sum(0), (x * x).sum(0)))
+            torch.distributed.all_reduce(mom)
+            n = mom[0].item()
+            m = mom[1 : 1 + x.shape[1]] / n
+            v = (mom[1 + x.shape[1] :] / n - m * m).clamp(min=0)
         tot = self.count + n
         delta = m - self.mean
         self.mean += delta * n / tot

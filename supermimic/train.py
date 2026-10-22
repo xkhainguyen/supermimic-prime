@@ -57,14 +57,34 @@ from supermimic.robot import default_joint_pos_list
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-torch.manual_seed(args.seed)
+# data parallel (torchrun): one simulator, buffer and motion library per GPU; gradients and running
+# normalizer statistics are averaged across GPUs; lr scales with sqrt(#GPUs) (paper Table A.5)
+WORLD = int(os.environ.get("WORLD_SIZE", "1"))
+RANK = int(os.environ.get("RANK", "0"))
+if WORLD > 1:
+    import torch.distributed as dist
+
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    args.lr *= math.sqrt(WORLD)
+dev = f"cuda:{torch.cuda.current_device()}"
+torch.manual_seed(args.seed)  # identical network initialization on every rank
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
-dev = "cuda:0"
-os.makedirs(args.log_dir, exist_ok=True)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+if RANK == 0:
+    os.makedirs(args.log_dir, exist_ok=True)
+    json.dump(vars(args) | {"world_size": WORLD}, open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+
+
+def sync_grads(m: nn.Module):
+    if WORLD == 1:
+        return
+    for p in m.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad)
+            p.grad /= WORLD
 
 kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+motion = MotionLib.load(args.motion_dir, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
@@ -86,6 +106,7 @@ if args.resume:
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+torch.manual_seed(args.seed + 1000 * RANK + start_it)  # per-rank simulator, sampling and noise streams
 
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
@@ -151,6 +172,7 @@ def wm_update():
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
+    sync_grads(wm)
     nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     opt_wm.step()
     m = w["mask"][:, -1]
@@ -215,6 +237,7 @@ def policy_update():
     loss.backward()
     if PROFILE:
         torch.cuda.synchronize(); tq2 = time.time()
+    sync_grads(pi)
     gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
     if torch.isfinite(gn):
@@ -249,6 +272,7 @@ def policy_update():
                 v_loss = ((critic(Xf[idx]) - Yf[idx]) ** 2).mean()
                 opt_v.zero_grad(set_to_none=True)
                 v_loss.backward()
+                sync_grads(critic)
                 nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
                 opt_v.step()
     if PROFILE:
@@ -280,7 +304,7 @@ def collect(n_steps: int, stats: dict):
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
         wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
         wm.out_norm.update(wm.targets(S0, S1))
-        sim_steps += args.num_envs
+        sim_steps += args.num_envs * WORLD
         stats["r"].append(out["r"].mean() / 0.1)
         if "ep_len" in out:
             stats["ep_len"].append(out["ep_len"].mean())
@@ -290,8 +314,8 @@ def collect(n_steps: int, stats: dict):
 
 stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
 collect(max(args.warmup_steps, args.wm_window), stats)
-log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
-if start_it == 0:
+log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a") if RANK == 0 else None
+if start_it == 0 and RANK == 0:
     log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
 t_start = time.time() - wall_offset
 t_log = time.time()
@@ -322,7 +346,7 @@ for it in range(start_it, args.iterations):
             torch.cuda.synchronize(); tp3 = time.time()
             print(f"[prof] collect {1e3*(tp1-tp0):.0f} ms ({n} steps) | wm {1e3*(tp2-tp1):.0f} ms | policy+critic {1e3*(tp3-tp2):.0f} ms", flush=True)
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
-    if (it + 1) % args.log_every == 0:
+    if (it + 1) % args.log_every == 0 and RANK == 0:
         mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
         ips = args.log_every / (time.time() - t_log)
         t_log = time.time()
@@ -336,7 +360,10 @@ for it in range(start_it, args.iterations):
               f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
-    if (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations:
+    elif (it + 1) % args.log_every == 0:
+        stats = {k: [] for k in stats}
+        agg = {k: [] for k in agg}
+    if ((it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations) and RANK == 0:
         ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
               "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
               "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
