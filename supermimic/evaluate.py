@@ -42,7 +42,7 @@ from supermimic.robot import default_joint_pos_list
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
 kin = G1Kinematics(dev)
-motion = MotionLib.load(args.motion_dir, kin, dev)
+motion = MotionLib.load(args.motion_dir, kin, dev, precompute_bodies=False)  # eval time is not counted; fits 48 GB GPUs
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 C = len(motion.names)
 
@@ -56,41 +56,69 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     pi.load_state_dict(ck["pi"])
     pi.eval()
     N = env.N
-    assert record is None or C <= N, "--record needs every motion in one chunk"
+    assert record is None or C <= N, "--record needs every motion in flight at once"
     ret = torch.zeros(C, device=dev)
     failed = torch.zeros(C, dtype=torch.bool, device=dev)
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
+    # work queue, longest motions first: an env that finishes a motion starts the next one
     order = torch.argsort(motion.clip_len, descending=True)
-    for c0 in range(0, C, N):
-        clips = order[c0 : c0 + N]
-        n = len(clips)
-        # spare envs replay the chunk's first motions and are ignored
-        slot = torch.arange(N, device=dev) % n
-        env.done_eval[:] = False
-        env.failed_eval[:] = False
-        env.reset(torch.arange(N, device=dev), motion.clip_start[clips[slot]])
-        env.done_eval[n:] = True
-        clip_end = motion.clip_end[clips[slot]]
-        r_sum = torch.zeros(N, device=dev)
-        hist = None
-        while not bool(env.done_eval.all()):
-            S = env.state()
-            o = mdp.obs(S, env.a_prev, env.xi, env.f)
-            hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-            a = pi(hist, motion.goal(env.f, K))
-            alive = ~env.done_eval.clone()
-            if record:
-                from supermimic.rotations import mat_to_quat
+    n0 = min(N, C)
+    slot = torch.full((N,), -1, dtype=torch.long, device=dev)  # motion index per env, -1 = idle
+    slot[:n0] = order[:n0]
+    nxt = n0
+    replay = order[torch.arange(N, device=dev) % n0]  # idle envs replay a motion and are ignored
+    env.done_eval[:] = False
+    env.failed_eval[:] = False
+    env.reset(torch.arange(N, device=dev), motion.clip_start[replay])
+    env.done_eval[n0:] = True
+    clip_end = motion.clip_end[replay].clone()
+    r_sum = torch.zeros(N, device=dev)
+    fresh = torch.ones(N, dtype=torch.bool, device=dev)
+    hist = None
+    while True:
+        S = env.state()
+        o = mdp.obs(S, env.a_prev, env.xi, env.f)
+        hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
+        hist[fresh] = o[fresh].unsqueeze(1).expand(-1, Hh, -1)
+        fresh[:] = False
+        a = pi(hist, motion.goal(env.f, K))
+        alive = ~env.done_eval.clone()
+        if record:
+            from supermimic.rotations import mat_to_quat
 
-                traj["root_p"].append(S[0][:n].cpu()), traj["root_quat"].append(mat_to_quat(S[1])[:n].cpu())
-                traj["q"].append(S[4][:n].cpu()), traj["f"].append(env.f[:n].cpu()), traj["alive"].append(alive[:n].cpu())
-            out = env.step(a)
-            r_sum += torch.where(alive, out["r"], 0.0)
-            env.f = torch.minimum(env.f, clip_end - 1)  # finished motions keep stepping; keep f+1 in range
-        ret[clips] = r_sum[:n]
-        failed[clips] = env.failed_eval[:n]
+            traj["root_p"].append(S[0][:n0].cpu()), traj["root_quat"].append(mat_to_quat(S[1])[:n0].cpu())
+            traj["q"].append(S[4][:n0].cpu()), traj["f"].append(env.f[:n0].cpu()), traj["alive"].append(alive[:n0].cpu())
+        out = env.step(a)
+        r_sum += torch.where(alive, out["r"], 0.0)
+        env.f = torch.minimum(env.f, clip_end - 1)  # finished motions keep stepping; keep f+1 in range
+        finished = env.done_eval & (slot >= 0)
+        if record is None and bool(finished.any()):
+            ids = finished.nonzero(as_tuple=False).squeeze(-1)
+            ret[slot[ids]] = r_sum[ids]
+            failed[slot[ids]] = env.failed_eval[ids]
+            k = min(len(ids), C - nxt)
+            if k > 0:
+                new_ids, new = ids[:k], order[nxt : nxt + k]
+                nxt += k
+                slot[new_ids] = new
+                env.done_eval[new_ids] = False
+                env.failed_eval[new_ids] = False
+                env.reset(new_ids, motion.clip_start[new])
+                clip_end[new_ids] = motion.clip_end[new]
+                r_sum[new_ids] = 0.0
+                fresh[new_ids] = True
+            slot[ids[k:]] = -1
+        if bool(env.done_eval.all()):
+            break
+    if record is None:
+        live = slot >= 0
+        ret[slot[live]] = r_sum[live]
+        failed[slot[live]] = env.failed_eval[live]
+    else:
+        ret[order[:n0]] = r_sum[:n0]
+        failed[order[:n0]] = env.failed_eval[:n0]
     if record:  # back to library order
-        inv = torch.argsort(order).cpu()
+        inv = torch.argsort(order[:n0]).cpu()
         traj = {k: [x[inv] for x in v] for k, v in traj.items()}
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
     res = {
