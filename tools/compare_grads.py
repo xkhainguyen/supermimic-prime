@@ -79,13 +79,15 @@ class CpuSim:
             mujoco.mj_step(self.m, self.d)
 
     def foot_contacts(self) -> dict:
-        out = {"left": 0, "right": 0}
+        """Floor contacts of the left foot, the right foot, and every other robot body ("body")."""
+        out = {"left": 0, "right": 0, "body": 0}
         for c in self.d.contact[: self.d.ncon]:
-            for g in (c.geom1, c.geom2):
-                b = self.m.geom_bodyid[g]
-                for s, fb in self.foot_body.items():
-                    if b == fb and self.floor in (c.geom1, c.geom2):
-                        out[s] += 1
+            if self.floor not in (c.geom1, c.geom2):
+                continue
+            g = c.geom2 if c.geom1 == self.floor else c.geom1
+            b = self.m.geom_bodyid[g]
+            side = next((s for s, fb in self.foot_body.items() if b == fb), "body")
+            out[side] += 1
         return out
 
     def S(self):
@@ -153,7 +155,10 @@ def main():
     ap.add_argument("--clip", default="walk1_subject1")
     ap.add_argument("--start_s", type=float, default=4.0, help="seconds of policy rollout before searching for a touchdown")
     ap.add_argument("--N", type=int, default=6, help="control steps in the comparison window")
-    ap.add_argument("--td", type=int, default=2, help="touchdown happens at this step of the window")
+    ap.add_argument("--td", type=int, default=2, help="touchdown/liftoff happens at this step of the window")
+    ap.add_argument("--select", default="touchdown", choices=["touchdown", "liftoff", "stance", "flight", "body"],
+                    help="contact situation of the window: a foot lands at step td, a foot leaves at td, both feet on the "
+                         "ground throughout, both feet airborne at the start, or a non-foot body on the floor")  # fmt: skip
     ap.add_argument("--eps", type=float, nargs="+", default=[1e-2, 1e-3, 1e-4, 1e-5])
     ap.add_argument("--out", default="results/grad_compare.json")
     ap.add_argument("--backend", default="cpu", choices=["cpu", "mjlab"], help="simulator for the finite differences")
@@ -207,19 +212,32 @@ def main():
         states.append(sim.get_state()), contacts.append(sim.foot_contacts()), actions.append(act[0].double().numpy())
         sim.step(act[0].double().numpy())
         a_prev = act
-    # 2) window start: one foot airborne at t0 and touching down within the next N steps
-    t0 = None
-    for t in range(int(a.start_s / 0.02), T - a.N):
-        for s in ("left", "right"):
-            if all(contacts[t + k][s] == 0 for k in range(a.td)) and contacts[t + a.td][s] > 0:
-                t0, side = t, s
-                break
-        if t0 is not None:
+    # 2) window start for the requested contact situation
+    def match(t):
+        c = lambda k, s_: contacts[t + k][s_]  # noqa: E731
+        for s_ in ("left", "right"):
+            if a.select == "touchdown" and all(c(k, s_) == 0 for k in range(a.td)) and c(a.td, s_) > 0:
+                return s_
+            if a.select == "liftoff" and all(c(k, s_) > 0 for k in range(a.td)) and c(a.td, s_) == 0:
+                return s_
+        if a.select == "stance" and all(c(k, "left") > 0 and c(k, "right") > 0 for k in range(a.N + 1)):
+            return "both"
+        if a.select == "flight" and c(0, "left") == 0 and c(0, "right") == 0:
+            return "both"
+        if a.select == "body" and c(0, "body") > 0:
+            return "body"
+        return None
+
+    t0 = side = None
+    for t in range(int(a.start_s / 0.02), T - a.N - 1):
+        side = match(t)
+        if side is not None:
+            t0 = t
             break
-    assert t0 is not None, "no touchdown found"
-    td = next(k for k in range(1, a.N) if contacts[t0 + k][side] > 0)
-    print(f"window: clip {a.clip}, t0 = {t0} ({t0 * 0.02:.2f} s), {side} foot airborne, touchdown at step +{td}, N = {a.N}")
-    print("foot contacts per step:", [(contacts[t0 + k]["left"], contacts[t0 + k]["right"]) for k in range(a.N + 1)])
+    assert t0 is not None, f"no {a.select} window found"
+    td = a.td
+    print(f"window: clip {a.clip}, t0 = {t0} ({t0 * 0.02:.2f} s), {a.select} ({side}), N = {a.N}")
+    print("floor contacts (left, right, body) per step:", [(contacts[t0 + k]["left"], contacts[t0 + k]["right"], contacts[t0 + k]["body"]) for k in range(a.N + 1)])
     acts = np.stack(actions[t0 : t0 + a.N])
     x_start = states[t0]
 
@@ -309,8 +327,8 @@ def main():
 
     # 5) report
     pred_err = [float((feat(wm_nom[k], R_nom[k].float())[0] - F_nom[k].float()).abs().max()) for k in range(a.N)]
-    res = {"clip": a.clip, "t0": t0, "side": side, "touchdown_step": td, "N": a.N, "eps": a.eps,
-           "contacts": [(contacts[t0 + k]["left"], contacts[t0 + k]["right"]) for k in range(a.N + 1)],
+    res = {"clip": a.clip, "select": a.select, "t0": t0, "side": side, "td": td, "N": a.N, "eps": a.eps, "ref_eps": a.ref_eps,
+           "backend": a.backend, "contacts": [(contacts[t0 + k]["left"], contacts[t0 + k]["right"], contacts[t0 + k]["body"]) for k in range(a.N + 1)],
            "wm_open_loop_max_abs_state_err": pred_err, "d_s/d_a0": {}, "d_s/d_s0": {}}  # fmt: skip
     for name, Jw, Js in (("d_s/d_a0", J_wm_a, J_sim_a), ("d_s/d_s0", J_wm_s, J_sim_s)):
         print(f"\n=== {name}   (cos: cosine similarity WM vs sim; rel: ||J_wm - J_sim|| / ||J_sim||; sim = FD at eps {a.ref_eps:g})")
