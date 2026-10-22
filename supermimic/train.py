@@ -363,6 +363,14 @@ for it in range(start_it, args.iterations):
     elif (it + 1) % args.log_every == 0:
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
+    if WORLD > 1 and (it + 1) % 1000 == 0:  # ranks must hold identical parameters
+        with torch.no_grad():
+            fp = torch.stack([torch.cat([p.double().sum().view(1) for p in m.parameters()]).sum() for m in (wm, pi, critic)])
+            fps = [torch.zeros_like(fp) for _ in range(WORLD)]
+            dist.all_gather(fps, fp)
+            if RANK == 0:
+                dev_ = max(float((f - fps[0]).abs().max()) for f in fps)
+                print(f"[ddp] it {it + 1} max parameter-checksum difference across ranks: {dev_:.3e}", flush=True)
     if ((it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations) and RANK == 0:
         ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
               "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
