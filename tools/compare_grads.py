@@ -96,6 +96,48 @@ class CpuSim:
         return (torch.tensor(qp[0:3]), R, torch.tensor(qv[0:3]), w, torch.tensor(qp[self.qadr]), torch.tensor(qv[self.vadr]))
 
 
+class MjlabBatch:
+    """The same scene in mjlab/MuJoCo-Warp (float32, GPU): one world per perturbed rollout, all stepped together
+    with the solver settings of the LAFAN training run."""
+
+    def __init__(self, n_worlds: int, cpu: CpuSim, device: str = "cuda:0"):
+        from mjlab.sim import Simulation
+
+        old = CollisionCfg(geom_names_expr=(".*_collision",), contype=0, conaffinity=1, condim=3, priority=1, friction=(1.0,))
+        cfg = EntityCfg(init_state=KNEES_BENT_KEYFRAME, collisions=(old,), spec_fn=get_spec, articulation=G1_ARTICULATION)
+        self.scene = Scene(SceneCfg(num_envs=n_worlds, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": cfg}), device=device)
+        self.sim = Simulation(num_envs=n_worlds, cfg=make_sim_cfg(nconmax=128, njmax=500), spec=self.scene.spec, device=device)
+        self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
+        self.robot = self.scene["robot"]
+        self.jid = torch.tensor(self.robot.find_joints(G1_JOINT_NAMES, preserve_order=True)[0], device=device)
+        self.cpu, self.device = cpu, device
+        self.qadr, self.vadr = torch.tensor(cpu.qadr, device=device), torch.tensor(cpu.vadr, device=device)
+        self.default_q = torch.tensor(cpu.default_q, dtype=torch.float32, device=device)
+        self.alpha = torch.tensor(cpu.alpha, dtype=torch.float32, device=device)
+
+    def roll(self, X: np.ndarray, A: np.ndarray, R_nom) -> np.ndarray:
+        dev, nq = self.device, self.cpu.m.nq
+        self.sim.reset()
+        self.robot.reset()
+        Xt = torch.tensor(X, dtype=torch.float32, device=dev)
+        self.sim.data.qpos[:] = Xt[:, :nq]
+        self.sim.data.qvel[:] = Xt[:, nq:]
+        out = []
+        for k in range(A.shape[1]):
+            target = self.default_q + self.alpha * torch.tensor(A[:, k], dtype=torch.float32, device=dev)
+            self.robot.set_joint_position_target(target, joint_ids=self.jid)
+            for _ in range(DECIMATION):
+                self.scene.write_data_to_sim()
+                self.sim.step()
+                self.scene.update(0.005)
+            qp, qv = self.sim.data.qpos, self.sim.data.qvel
+            R = quat_to_mat(qp[:, 3:7].double())
+            S = (qp[:, 0:3].double(), R, qv[:, 0:3].double(), (R @ qv[:, 3:6].double().unsqueeze(-1)).squeeze(-1),
+                 qp[:, self.qadr].double(), qv[:, self.vadr].double())  # fmt: skip
+            out.append(feat(S, R_nom[k].to(dev)).cpu().numpy())
+        return np.stack(out, 1)  # (W, N, 70)
+
+
 def feat(S, R_nom) -> torch.Tensor:
     """70-d state vector: root pos, root rotation as a rotation vector relative to R_nom, root lin/ang vel
     (world), joint pos, joint vel. Differences of this vector are what the Jacobians map to."""
@@ -114,6 +156,8 @@ def main():
     ap.add_argument("--td", type=int, default=2, help="touchdown happens at this step of the window")
     ap.add_argument("--eps", type=float, nargs="+", default=[1e-2, 1e-3, 1e-4, 1e-5])
     ap.add_argument("--out", default="results/grad_compare.json")
+    ap.add_argument("--backend", default="cpu", choices=["cpu", "mjlab"], help="simulator for the finite differences")
+    ap.add_argument("--ref_eps", type=float, default=1e-3, help="finite-difference step the WM is compared against")
     a = ap.parse_args()
     torch.set_default_dtype(torch.float32)
     dev = "cpu"
@@ -192,19 +236,7 @@ def main():
     R_nom = [S[1] for S in nom]
     F_nom = [feat(S, Rn) for S, Rn in zip(nom, R_nom)]
 
-    def sim_jac_action(eps):
-        J = np.zeros((a.N, 70, 29))
-        for j in range(29):
-            Ap, Am = acts.copy(), acts.copy()
-            Ap[0, j] += eps
-            Am[0, j] -= eps
-            sp, sm = sim_roll(x_start, Ap), sim_roll(x_start, Am)
-            for k in range(a.N):
-                J[k, :, j] = ((feat(sp[k], R_nom[k]) - feat(sm[k], R_nom[k])) / (2 * eps)).numpy()
-        return J
-
-    # initial-state Jacobian w.r.t. the 70-d feature of s_0 (perturb root pos / vel, joint pos / vel; rotation
-    # perturbed through the free-joint quaternion)
+    # initial-state perturbations act on the 70-d feature of s_0 (rotation through the free-joint quaternion)
     sim.set_state(x_start)
     S0 = sim.S()
     R0 = S0[1]
@@ -222,18 +254,31 @@ def main():
         x[sim.m.nq + sim.vadr] += dx[41:70]
         return x
 
-    def sim_jac_state(eps):
-        J = np.zeros((a.N, 70, 70))
+    # every perturbed rollout: (+eps, -eps) for each action dim of a_0 and each s_0 feature dim, per eps
+    X, A, index = [], [], []
+    for eps in a.eps:
+        for j in range(29):
+            for sgn in (1, -1):
+                Ap = acts.copy()
+                Ap[0, j] += sgn * eps
+                X.append(x_start), A.append(Ap), index.append(("a", eps, j, sgn))
         for j in range(70):
-            d = np.zeros(70)
-            d[j] = eps
-            sp, sm = sim_roll(x_from_feat_delta(d), acts), sim_roll(x_from_feat_delta(-d), acts)
-            for k in range(a.N):
-                J[k, :, j] = ((feat(sp[k], R_nom[k]) - feat(sm[k], R_nom[k])) / (2 * eps)).numpy()
-        return J
+            for sgn in (1, -1):
+                d = np.zeros(70)
+                d[j] = sgn * eps
+                X.append(x_from_feat_delta(d)), A.append(acts), index.append(("s", eps, j, sgn))
+    X, A = np.stack(X), np.stack(A)
+    if a.backend == "cpu":
+        F = np.stack([np.stack([feat(S, R_nom[k]).numpy() for k, S in enumerate(sim_roll(x, Aw))]) for x, Aw in zip(X, A)])
+    else:
+        F = MjlabBatch(len(X), sim).roll(X, A, R_nom)
+    print(f"simulator backend: {a.backend}, {len(X)} perturbed rollouts")
+    J_sim_a = {eps: np.zeros((a.N, 70, 29)) for eps in a.eps}
+    J_sim_s = {eps: np.zeros((a.N, 70, 70)) for eps in a.eps}
+    for i, (kind, eps, j, sgn) in enumerate(index):
+        J = (J_sim_a if kind == "a" else J_sim_s)[eps]
+        J[:, :, j] += sgn * F[i] / (2 * eps)
 
-    J_sim_a = {eps: sim_jac_action(eps) for eps in a.eps}
-    J_sim_s = {eps: sim_jac_state(eps) for eps in a.eps}
 
     # 4) world model rollout and autograd Jacobians (fp32)
     S0f = tuple(x.float().unsqueeze(0) for x in S0)
@@ -268,12 +313,12 @@ def main():
            "contacts": [(contacts[t0 + k]["left"], contacts[t0 + k]["right"]) for k in range(a.N + 1)],
            "wm_open_loop_max_abs_state_err": pred_err, "d_s/d_a0": {}, "d_s/d_s0": {}}  # fmt: skip
     for name, Jw, Js in (("d_s/d_a0", J_wm_a, J_sim_a), ("d_s/d_s0", J_wm_s, J_sim_s)):
-        print(f"\n=== {name}   (cos: cosine similarity WM vs sim; rel: ||J_wm - J_sim|| / ||J_sim||; sim = FD at eps {a.eps[1]:g})")
+        print(f"\n=== {name}   (cos: cosine similarity WM vs sim; rel: ||J_wm - J_sim|| / ||J_sim||; sim = FD at eps {a.ref_eps:g})")
         print("FD consistency across eps (||J_eps - J_1e-3|| / ||J_1e-3||, all blocks), per step:")
         for eps in a.eps:
-            r = [np.linalg.norm(Js[eps][k] - Js[a.eps[1]][k]) / (np.linalg.norm(Js[a.eps[1]][k]) + 1e-12) for k in range(a.N)]
+            r = [np.linalg.norm(Js[eps][k] - Js[a.ref_eps][k]) / (np.linalg.norm(Js[a.ref_eps][k]) + 1e-12) for k in range(a.N)]
             print(f"   eps {eps:g}: " + " ".join(f"{x:6.3f}" for x in r))
-        J_ref = Js[a.eps[1]]
+        J_ref = Js[a.ref_eps]
         hdr = f"{'block':14s}" + "".join(f"  k={k + 1}:cos/rel/|wm|/|sim|" for k in range(a.N))
         print(hdr)
         res[name] = {}
