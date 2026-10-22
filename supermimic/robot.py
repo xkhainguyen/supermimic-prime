@@ -2,9 +2,9 @@
 
 mjlab's G1 MJCF is g1_29dof_rev_1_0, the model the LAFAN1 clips were retargeted to. Actuators are
 mjlab's BeyondMimic set (10 Hz natural frequency, damping ratio 2 on the reflected motor armature,
-action scale 0.25 * effort_limit / stiffness). Self-collisions are disabled, as in the Isaac Lab
-reproduction; every robot collision geom gets condim 3 and the highest priority, so its friction
-(the per-env sim context) is the one used against the ground.
+action scale 0.25 * effort_limit / stiffness) and its full collision model: self-collisions on
+(condim 1), foot capsules with condim 3 and priority over the ground, so the foot friction in the
+sim context is the one used against the floor.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
+    FULL_COLLISION,
     G1_ACTION_SCALE,
     G1_ARTICULATION,
     G1_XML,
@@ -19,7 +20,6 @@ from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
     get_spec,
 )
 from mjlab.entity import EntityCfg
-from mjlab.utils.spec_config import CollisionCfg
 
 MJCF_PATH = str(G1_XML)
 
@@ -46,14 +46,7 @@ TRACKED_BODIES = [
 
 DEFAULT_JOINT_POS = dict(KNEES_BENT_KEYFRAME.joint_pos)
 
-COLLISION = CollisionCfg(
-    geom_names_expr=(".*_collision",),
-    contype=0,
-    conaffinity=1,
-    condim=3,
-    priority=1,
-    friction=(0.6,),
-)
+FOOT_GEOMS = r"^(left|right)_foot[1-7]_collision$"
 
 
 def _lookup(table: dict[str, float], name: str, default: float) -> float:
@@ -75,7 +68,7 @@ def default_joint_pos_list() -> list[float]:
 def g1_cfg() -> EntityCfg:
     return EntityCfg(
         init_state=KNEES_BENT_KEYFRAME,
-        collisions=(COLLISION,),
+        collisions=(FULL_COLLISION,),
         spec_fn=get_spec,
         articulation=G1_ARTICULATION,
     )

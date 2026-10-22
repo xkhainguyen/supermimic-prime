@@ -18,14 +18,16 @@ from mjlab.terrains import TerrainEntityCfg
 
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
-from .robot import G1_JOINT_NAMES, action_scale, g1_cfg
+from .robot import FOOT_GEOMS, G1_JOINT_NAMES, action_scale, g1_cfg
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
 PHYSICS_DT = 0.005
 DECIMATION = round(CONTROL_DT / PHYSICS_DT)
 
 
-def make_sim_cfg(nconmax: int = 128, njmax: int = 500) -> SimulationCfg:
+def make_sim_cfg(nconmax: int = 64, njmax: int = 512) -> SimulationCfg:
+    """mjlab's G1 tracking-task solver settings; contact/constraint capacity raised because self-collisions
+    during falls and floor work exceed the task's njmax=250 (overflowing worlds silently drop constraints)."""
     return SimulationCfg(
         nconmax=nconmax,
         njmax=njmax,
@@ -61,23 +63,12 @@ class TrackingSim:
 
         # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
         self.sim.expand_model_fields(("geom_friction", "body_ipos"))
-        local_geoms = self.robot.find_geoms(".*_collision")[0]
+        local_geoms = self.robot.find_geoms(FOOT_GEOMS)[0]
         self.geom_ids = idx.geom_ids[torch.tensor(local_geoms, device=dev)]
         self.torso_bid = int(idx.body_ids[self.robot.find_bodies("torso_link")[0][0]])
+        # per-episode sim context (paper App. A, Table A.3), resampled in reset()
         self.xi = torch.zeros(self.N, 33, device=dev)
-        if eval_mode:
-            self.xi[:, 0] = 1.0
-        else:
-            self.xi[:, 0] = torch.empty(self.N, device=dev).uniform_(0.3, 1.2)
-            self.xi[:, 30:33] = torch.stack(
-                (
-                    torch.empty(self.N, device=dev).uniform_(-0.025, 0.025),
-                    torch.empty(self.N, device=dev).uniform_(-0.05, 0.05),
-                    torch.empty(self.N, device=dev).uniform_(-0.05, 0.05),
-                ),
-                -1,
-            )
-        self._apply_context()
+        self.xi[:, 0] = 1.0
 
         # ---- episode bookkeeping ----
         self.f = torch.zeros(self.N, dtype=torch.long, device=dev)
@@ -94,12 +85,25 @@ class TrackingSim:
         self.reset(torch.arange(self.N, device=dev))
 
     # ------------------------------------------------------------------ sim context
-    def _apply_context(self):
-        """Write friction (all robot collision geoms, which out-prioritize the ground) and torso CoM offset."""
+    def _sample_context(self, env_ids: torch.Tensor):
+        n, dev = len(env_ids), self.device
+        self.xi[env_ids, 0] = torch.empty(n, device=dev).uniform_(0.3, 1.2)
+        self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
+        self.xi[env_ids, 30:33] = torch.stack(
+            (
+                torch.empty(n, device=dev).uniform_(-0.025, 0.025),
+                torch.empty(n, device=dev).uniform_(-0.05, 0.05),
+                torch.empty(n, device=dev).uniform_(-0.05, 0.05),
+            ),
+            -1,
+        )
+
+    def _apply_context(self, env_ids: torch.Tensor):
+        """Write foot friction (shared by the foot geoms, which out-prioritize the ground) and torso CoM offset."""
         model = self.sim.model
-        model.geom_friction[:, self.geom_ids, 0] = self.xi[:, :1]
+        model.geom_friction[env_ids[:, None], self.geom_ids[None, :], 0] = self.xi[env_ids, :1]
         ipos0 = self.sim.get_default_field("body_ipos")[self.torso_bid]
-        model.body_ipos[:, self.torso_bid] = ipos0 + self.xi[:, 30:33]
+        model.body_ipos[env_ids, self.torso_bid] = ipos0 + self.xi[env_ids, 30:33]
         self.sim.recompute_constants(RecomputeLevel.set_const)
 
     # ------------------------------------------------------------------ state
@@ -150,6 +154,9 @@ class TrackingSim:
                  torch.empty(n, device=dev).uniform_(-0.78, 0.78)), -1)  # fmt: skip
             q = q + torch.empty_like(q).uniform_(-0.1, 0.1)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
+        if not self.eval_mode:
+            self._sample_context(env_ids)
+        self._apply_context(env_ids)
         self.sim.reset(env_ids)
         self.robot.reset(env_ids)
         self.robot.write_root_link_pose_to_sim(torch.cat((p, mat_to_quat(R)), -1), env_ids=env_ids)
@@ -162,8 +169,6 @@ class TrackingSim:
         self.start_bin[env_ids] = bins
         self.ep_disc_ret[env_ids] = 0.0
         self.ep_ret[env_ids] = 0.0
-        if not self.eval_mode:
-            self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
 
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:

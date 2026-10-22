@@ -31,8 +31,10 @@ parser.add_argument("--action_noise", type=float, default=0.1)
 parser.add_argument("--critic_epochs", type=int, default=5)
 parser.add_argument("--critic_minibatches", type=int, default=4)
 parser.add_argument("--no_critic", action="store_true")
-parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps before any update")
-parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-only iterations at the start")
+parser.add_argument("--warmup_steps", type=int, default=8, help="sim steps before any update (one k-step window)")
+parser.add_argument("--wm_only_iters", type=int, default=0, help="world-model-only iterations at the start (paper: none)")
+parser.add_argument("--wm_steps", type=int, default=1, help="WM optimizer steps per iteration; the --wm_batches batches are "
+                    "split evenly among them (paper Table A.5: one step on 10 x 2048 windows per policy update)")
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
 parser.add_argument("--log_every", type=int, default=50)
@@ -45,7 +47,7 @@ parser.add_argument("--critic_huber", type=float, default=0.0, help="Huber delta
 parser.add_argument("--critic_ema", type=float, default=0.0, help="EMA rate of a target critic for the GAE targets (0: none, as in the paper)")
 parser.add_argument("--critic_lr_scale", type=float, default=1.0)
 parser.add_argument("--lr_world_scale", type=str, default="sqrt", choices=["sqrt", "none"], help="multi-GPU lr scaling")
-parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+parser.add_argument("--amp", type=str, default="none", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
 
 import torch
@@ -180,17 +182,22 @@ if args.critic_ema > 0:
 
 
 # ------------------------------------------------------------------------------------------------
-def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
-    S_hat = wm_rollout(w["s"], w["a"], w["xi"])
-    loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
+def wm_update(n_batches: int):
+    """One optimizer step on n_batches batches of wm_batch windows (gradients accumulated)."""
     opt_wm.zero_grad(set_to_none=True)
-    loss.backward()
+    tot, e8 = 0.0, 0.0
+    for _ in range(n_batches):
+        w = buffer.sample_windows(args.wm_batch, args.wm_window)
+        S_hat = wm_rollout(w["s"], w["a"], w["xi"])
+        loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
+        (loss / n_batches).backward()
+        m = w["mask"][:, -1]
+        tot = tot + loss.detach() / n_batches
+        e8 = e8 + (e_last.detach() * m).sum() / m.sum().clamp(min=1) / n_batches
     sync_grads(wm)
     nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     opt_wm.step()
-    m = w["mask"][:, -1]
-    return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
+    return tot / args.wm_window, e8
 
 
 def sample_valid_starts(B: int):
@@ -369,8 +376,8 @@ for it in range(start_it, args.iterations):
     collect(n, stats)
     if prof:
         torch.cuda.synchronize(); tp1 = time.time()
-    for _ in range(args.wm_batches):
-        l, e8 = wm_update()
+    for _ in range(args.wm_steps):
+        l, e8 = wm_update(args.wm_batches // args.wm_steps)
     if prof:
         torch.cuda.synchronize(); tp2 = time.time()
     agg["wm"].append(l), agg["wm8"].append(e8)
