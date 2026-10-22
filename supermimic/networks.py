@@ -163,9 +163,9 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, in_dim: int):
+    def __init__(self, in_dim: int, layer_norm: bool = False):
         super().__init__()
-        self.net = mlp(in_dim, [256, 128], 1)
+        self.net = mlp(in_dim, [256, 128], 1, layer_norm=layer_norm)
         self.norm = RunningNorm(in_dim)
 
     def forward(self, x):

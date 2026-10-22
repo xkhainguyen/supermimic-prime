@@ -162,6 +162,16 @@ class MDP:
         alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
         return 1 - alive
 
+    def critic_features_lean(self, S, f, xi) -> torch.Tensor:
+        """Critic input closer to the paper's V(s, g, xi): invariant state, sim context, and the robot root's
+        pose relative to the reference root (the goal is relative to the reference, so this links the two)."""
+        p, R = S[0], S[1]
+        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
+        Ht = yaw_mat(R).transpose(-1, -2)
+        e_root = (Ht @ (rp - p).unsqueeze(-1)).squeeze(-1)
+        rel = mat_to_6d(R.transpose(-1, -2) @ rR)
+        return torch.cat((invariant_features(S), e_root, rel, xi), -1)
+
     def critic_features(self, S, f, xi) -> torch.Tensor:
         """Critic input: invariant state, goal, sim context, and robot-vs-reference errors."""
         m = self.motion
@@ -180,6 +190,7 @@ class MDP:
 
 
 CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
+CRITIC_EXTRA_LEAN = 3 + 6 + XI_DIM
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:

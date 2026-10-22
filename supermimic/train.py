@@ -47,6 +47,8 @@ parser.add_argument("--critic_clip", action="store_true", help="clamp critic tar
 parser.add_argument("--critic_huber", type=float, default=0.0, help="Huber delta for the critic loss (0: squared error)")
 parser.add_argument("--critic_ema", type=float, default=0.0, help="EMA rate of a target critic for the GAE targets (0: none, as in the paper)")
 parser.add_argument("--critic_lr_scale", type=float, default=1.0)
+parser.add_argument("--critic_inputs", type=str, default="full", choices=["full", "lean"])
+parser.add_argument("--critic_ln", action="store_true", help="LayerNorm in the critic MLP")
 parser.add_argument("--critic_norm_max_count", type=float, default=2e8, help="samples after which the critic input normalizer freezes")
 parser.add_argument("--norm_max_count", type=float, default=2e8, help="same for the policy and world-model normalizers")
 parser.add_argument("--lr_world_scale", type=str, default="sqrt", choices=["sqrt", "none"], help="multi-GPU lr scaling")
@@ -59,7 +61,7 @@ import torch.nn as nn
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.mdp import CRITIC_EXTRA, CRITIC_EXTRA_LEAN, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
 from supermimic.motion import MotionLib
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
@@ -98,11 +100,11 @@ motion = MotionLib.load(args.motion_dir, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
-CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
+CRITIC_IN = INV_DIM + (CRITIC_EXTRA if args.critic_inputs == "full" else CRITIC_EXTRA_LEAN) + GOAL_DIM
 
 wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
-critic = Critic(CRITIC_IN).to(dev)
+critic = Critic(CRITIC_IN, layer_norm=args.critic_ln).to(dev)
 for m_ in (wm.in_norm, wm.out_norm, pi.obs_norm, pi.goal_norm):
     m_.max_count = args.norm_max_count
 critic.norm.max_count = args.critic_norm_max_count
@@ -159,7 +161,8 @@ def _reward_term(S, f, a, a_prev):
 
 
 def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
+    feats = mdp.critic_features(S, f, xi_n) if args.critic_inputs == "full" else mdp.critic_features_lean(S, f, xi_n)
+    return torch.cat((feats, g), -1)
 
 
 wm_rollout = torch.compile(_wm_rollout)
