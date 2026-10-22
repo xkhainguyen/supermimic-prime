@@ -47,6 +47,8 @@ parser.add_argument("--critic_clip", action="store_true", help="clamp critic tar
 parser.add_argument("--critic_huber", type=float, default=0.0, help="Huber delta for the critic loss (0: squared error)")
 parser.add_argument("--critic_ema", type=float, default=0.0, help="EMA rate of a target critic for the GAE targets (0: none, as in the paper)")
 parser.add_argument("--critic_lr_scale", type=float, default=1.0)
+parser.add_argument("--critic_norm_max_count", type=float, default=2e8, help="samples after which the critic input normalizer freezes")
+parser.add_argument("--norm_max_count", type=float, default=2e8, help="same for the policy and world-model normalizers")
 parser.add_argument("--lr_world_scale", type=str, default="sqrt", choices=["sqrt", "none"], help="multi-GPU lr scaling")
 parser.add_argument("--amp", type=str, default="none", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
@@ -101,6 +103,9 @@ CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 wm = WorldModel().to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
+for m_ in (wm.in_norm, wm.out_norm, pi.obs_norm, pi.goal_norm):
+    m_.max_count = args.norm_max_count
+critic.norm.max_count = args.critic_norm_max_count
 opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
 opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr * args.critic_lr_scale)
