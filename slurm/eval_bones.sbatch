@@ -10,10 +10,11 @@
 #SBATCH --requeue
 #SBATCH --output=/data/pulkitag/users/khain/supermimic-mjlab/logs/slurm/%x_%j.out
 # Scores every checkpoint of logs/RUN on all filtered BONES-SEED motions (paper App. F.1) as they appear.
-# Usage: sbatch slurm/eval_bones.sbatch RUN
+# Usage: sbatch slurm/eval_bones.sbatch RUN [MOTION_DIR]
 set -euo pipefail
 RUN=$1
+MOTION_DIR=${2:-data/bones_seed}
 cd /data/pulkitag/users/khain/supermimic-mjlab
 export PATH="${HOME}/.local/bin:${PATH}" MJLAB_WARP_QUIET=1
 mkdir -p logs/$RUN
-uv run --frozen python supermimic/evaluate.py --run_dir logs/$RUN --motion_dir data/bones_seed --watch >> logs/$RUN/eval.log 2>&1
+uv run --frozen python supermimic/evaluate.py --run_dir logs/$RUN --motion_dir $MOTION_DIR --watch >> logs/$RUN/eval.log 2>&1
