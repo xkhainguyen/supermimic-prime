@@ -48,6 +48,9 @@ parser.add_argument("--critic_huber", type=float, default=0.0, help="Huber delta
 parser.add_argument("--critic_ema", type=float, default=0.0, help="EMA rate of a target critic for the GAE targets (0: none, as in the paper)")
 parser.add_argument("--critic_lr_scale", type=float, default=1.0)
 parser.add_argument("--sampler", type=str, default="completion", choices=["completion", "vibed"], help="reset-bin scoring")
+parser.add_argument("--bin_prior", type=str, default=None, help="off-paper: npz from tools/bin_clusters.py (cluster-balanced reset weights)")
+parser.add_argument("--bin_prior_alpha", type=float, default=0.3, help="cluster share ~ size^alpha")
+parser.add_argument("--softmax_cap", type=float, default=0.0, help="off-paper: per-bin cap of the reset softmax, x uniform share (0: none)")
 parser.add_argument("--critic_inputs", type=str, default="full", choices=["full", "lean"])
 parser.add_argument("--critic_ln", action="store_true", help="LayerNorm in the critic MLP")
 parser.add_argument("--critic_norm_max_count", type=float, default=2e8, help="samples after which the critic input normalizer freezes")
@@ -56,6 +59,7 @@ parser.add_argument("--lr_world_scale", type=str, default="sqrt", choices=["sqrt
 parser.add_argument("--amp", type=str, default="none", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -331,7 +335,13 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, gamma=args.gamma, device=dev, sampler=args.sampler)
+bin_prior = None
+if args.bin_prior:
+    _bp = np.load(args.bin_prior)
+    assert int(_bp["num_bins"]) == motion.num_bins, f"{args.bin_prior}: {int(_bp['num_bins'])} bins, library has {motion.num_bins}"
+    bin_prior = torch.from_numpy(_bp[f"w_alpha_{args.bin_prior_alpha:g}"])
+env = TrackingSim(args.num_envs, motion, mdp, gamma=args.gamma, device=dev, sampler=args.sampler, bin_prior=bin_prior,
+                  softmax_cap=args.softmax_cap)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 

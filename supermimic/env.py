@@ -35,13 +35,23 @@ def make_sim_cfg(nconmax: int = 64, njmax: int = 512) -> SimulationCfg:
     )
 
 
+def cap_probs(p: torch.Tensor, cap: float, iters: int = 8) -> torch.Tensor:
+    """Distribution with no entry above cap; the excess goes to uncapped entries in proportion to their mass."""
+    for _ in range(iters):
+        over = p > cap
+        excess = (p - cap).clamp_min(0).sum()
+        under = torch.where(over, torch.zeros_like(p), p)
+        p = torch.where(over, torch.full_like(p, cap), p + excess * under / under.sum().clamp_min(1e-30))
+    return p
+
+
 class TrackingSim:
     """Batched G1 motion-tracking simulator."""
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
                  max_episode_steps: int = 500, reset_noise: bool = True, device: str = "cuda:0",
                  sim_cfg: SimulationCfg | None = None, contact_model: str = "paper", auto_reset: bool = True,
-                 sampler: str = "completion"):  # fmt: skip
+                 sampler: str = "completion", bin_prior: torch.Tensor | None = None, softmax_cap: float = 0.0):  # fmt: skip
         """contact_model "legacy" reproduces the first LAFAN1 run's contacts (see robot.LEGACY_COLLISION);
         auto_reset False leaves finished episodes running (for paired rollouts)."""
         self.device = dev = device
@@ -53,6 +63,10 @@ class TrackingSim:
         # "vibed": start bin only, raw return with an infinite-horizon mean-reward bootstrap, which scores
         # short clip-end episodes far below their true difficulty.
         self.sampler = sampler
+        # off-paper (allmimic #28, #19): mean-1 per-bin weights multiplying the reset distribution, and a per-bin
+        # cap on the softmax term at softmax_cap x the uniform share (water-filling)
+        self.bin_prior = None if bin_prior is None else bin_prior.to(dev)
+        self.softmax_cap = softmax_cap
         scene_cfg = SceneCfg(num_envs=num_envs, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg(contact_model)})
         self.scene = Scene(scene_cfg, device=dev)
         if sim_cfg is None:
@@ -137,8 +151,12 @@ class TrackingSim:
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
         soft = torch.softmax(-25.0 * (self.bin_G if self.sampler == "completion" else self.bin_G / self.G_max), 0)
+        if self.softmax_cap > 0:
+            soft = cap_probs(soft, self.softmax_cap / m.num_bins)
         self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
         probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
+        if self.bin_prior is not None:
+            probs = probs * self.bin_prior
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
         end = torch.minimum(m.bin_end[bins] if self.sampler == "completion" else start + 50, m.clip_end[m.bin_clip[bins]])  # >= 1 step left
