@@ -71,15 +71,17 @@ class MotionLib:
                     bp[sl], bv[sl], bw[sl] = p_, v_, w_
                     bR[sl] = mat_to_quat(R_) if self._body_quat else R_
             self._bodies = (bp, bR, bv, bw)
-        # 1 s bins
-        nb = torch.div(self.clip_len + BIN_FRAMES - 1, BIN_FRAMES, rounding_mode="floor")
+        # 1 s bins; a clip's leftover frames (< 1 s) join its last bin, so no bin is only a few frames long
+        nb = torch.clamp(torch.div(self.clip_len, BIN_FRAMES, rounding_mode="floor"), min=1)
         self.bin_clip = torch.repeat_interleave(torch.arange(len(lens), device=device), nb)
         bin_off = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long, device=device), nb[:-1])), 0)
         local_bin = torch.arange(len(self.bin_clip), device=device) - bin_off[self.bin_clip]
         self.bin_start = self.clip_start[self.bin_clip] + local_bin * BIN_FRAMES
+        last = local_bin == nb[self.bin_clip] - 1
+        self.bin_end = torch.where(last, self.clip_end[self.bin_clip] + 1, self.bin_start + BIN_FRAMES)  # exclusive
         self.num_bins = len(self.bin_start)
         local_frame = torch.arange(F_, device=device) - self.clip_start[self.clip_id]
-        self.frame_bin = bin_off[self.clip_id] + torch.div(local_frame, BIN_FRAMES, rounding_mode="floor")
+        self.frame_bin = bin_off[self.clip_id] + torch.minimum(torch.div(local_frame, BIN_FRAMES, rounding_mode="floor"), nb[self.clip_id] - 1)
 
     def _fk(self, f: torch.Tensor):
         return self.kin.forward(self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f])

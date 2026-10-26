@@ -40,11 +40,16 @@ class TrackingSim:
 
     def __init__(self, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
                  max_episode_steps: int = 500, reset_noise: bool = True, device: str = "cuda:0",
-                 sim_cfg: SimulationCfg | None = None, contact_model: str = "paper", auto_reset: bool = True):  # fmt: skip
+                 sim_cfg: SimulationCfg | None = None, contact_model: str = "paper", auto_reset: bool = True,
+                 sampler: str = "completion"):  # fmt: skip
         """contact_model "legacy" reproduces the first LAFAN1 run's contacts (see robot.LEGACY_COLLISION);
         auto_reset False leaves finished episodes running (for paired rollouts)."""
         self.device = dev = device
         self.auto_reset = auto_reset
+        # "completion": a bin's score is the discounted return earned from the start frame divided by the
+        # largest attainable before the clip ends; "vibed": raw return with an infinite-horizon mean-reward
+        # bootstrap, which scores short clip-end episodes far below their true difficulty
+        self.sampler = sampler
         scene_cfg = SceneCfg(num_envs=num_envs, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg(contact_model)})
         self.scene = Scene(scene_cfg, device=dev)
         if sim_cfg is None:
@@ -82,6 +87,7 @@ class TrackingSim:
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
+        self.start_f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
@@ -123,12 +129,12 @@ class TrackingSim:
     # ------------------------------------------------------------------ reset
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
         m = self.motion
-        soft = torch.softmax(-25.0 * self.bin_G / self.G_max, 0)
+        soft = torch.softmax(-25.0 * (self.bin_G if self.sampler == "completion" else self.bin_G / self.G_max), 0)
         self.bin_w_avg.mul_(0.999).add_(0.001 * soft)
         probs = 0.5 / m.num_bins + 0.4 * soft + 0.1 * self.bin_w_avg / self.bin_w_avg.sum()
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
-        end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
+        end = torch.minimum(m.bin_end[bins] if self.sampler == "completion" else start + 50, m.clip_end[m.bin_clip[bins]])  # >= 1 step left
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return f, bins
 
@@ -174,6 +180,7 @@ class TrackingSim:
         self.start_bin[env_ids] = bins
         self.ep_disc_ret[env_ids] = 0.0
         self.ep_ret[env_ids] = 0.0
+        self.start_f[env_ids] = frames
 
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:
@@ -215,8 +222,16 @@ class TrackingSim:
         if len(ids) > 0:
             # bin return estimate; truncated episodes bootstrap with their mean reward
             T = self.ep_step[ids].float()
-            boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
-            G = self.ep_disc_ret[ids] + boot
+            if self.sampler == "completion":
+                f_s = self.start_f[ids]
+                L = (self.motion.clip_end[self.motion.clip_id[f_s]] - f_s).float()  # steps available before the clip ends
+                g = self.gamma
+                rest = torch.clamp(L - T, min=0)
+                boot = torch.where(term[ids], 0.0, g**T * (self.ep_ret[ids] / T) * (1 - g**rest) / (1 - g))
+                G = (self.ep_disc_ret[ids] + boot) / (MAX_STEP_REWARD * (1 - g**L) / (1 - g)).clamp(min=1e-6)
+            else:
+                boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
+                G = self.ep_disc_ret[ids] + boot
             b = self.start_bin[ids]
             self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
             out["ep_len"] = T

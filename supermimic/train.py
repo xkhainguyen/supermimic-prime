@@ -47,6 +47,7 @@ parser.add_argument("--critic_clip", action="store_true", help="clamp critic tar
 parser.add_argument("--critic_huber", type=float, default=0.0, help="Huber delta for the critic loss (0: squared error)")
 parser.add_argument("--critic_ema", type=float, default=0.0, help="EMA rate of a target critic for the GAE targets (0: none, as in the paper)")
 parser.add_argument("--critic_lr_scale", type=float, default=1.0)
+parser.add_argument("--sampler", type=str, default="completion", choices=["completion", "vibed"], help="reset-bin scoring")
 parser.add_argument("--critic_inputs", type=str, default="full", choices=["full", "lean"])
 parser.add_argument("--critic_ln", action="store_true", help="LayerNorm in the critic MLP")
 parser.add_argument("--critic_norm_max_count", type=float, default=2e8, help="samples after which the critic input normalizer freezes")
@@ -330,7 +331,7 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-env = TrackingSim(args.num_envs, motion, mdp, gamma=args.gamma, device=dev)
+env = TrackingSim(args.num_envs, motion, mdp, gamma=args.gamma, device=dev, sampler=args.sampler)
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
 obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 
