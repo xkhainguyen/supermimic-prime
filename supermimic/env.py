@@ -46,9 +46,12 @@ class TrackingSim:
         auto_reset False leaves finished episodes running (for paired rollouts)."""
         self.device = dev = device
         self.auto_reset = auto_reset
-        # "completion": a bin's score is the discounted return earned from the start frame divided by the
-        # largest attainable before the clip ends; "vibed": raw return with an infinite-horizon mean-reward
-        # bootstrap, which scores short clip-end episodes far below their true difficulty
+        # "completion" (after LaoYang1994/SuperMimic-Rep): every step of a finished episode scores the bin it
+        # was taken in by its discounted return-to-go divided by the largest attainable over the steps the
+        # episode would still have run without failing (clip end or time limit), clipped to [0, 1]; bins start
+        # at 1.0 and move by EMA 0.05; time-limit truncations drop their last 100 steps.
+        # "vibed": start bin only, raw return with an infinite-horizon mean-reward bootstrap, which scores
+        # short clip-end episodes far below their true difficulty.
         self.sampler = sampler
         scene_cfg = SceneCfg(num_envs=num_envs, terrain=TerrainEntityCfg(terrain_type="plane"), entities={"robot": g1_cfg(contact_model)})
         self.scene = Scene(scene_cfg, device=dev)
@@ -89,7 +92,11 @@ class TrackingSim:
         self.ep_ret = torch.zeros(self.N, device=dev)
         self.start_f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.G_max = MAX_STEP_REWARD / (1 - gamma)
-        self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
+        self.bin_G = torch.full((motion.num_bins,), 1.0 if sampler == "completion" else 0.0, device=dev)
+        self.log_T = max_episode_steps + 1
+        self.ep_r = torch.zeros(self.N, self.log_T, device=dev)
+        self.ep_b = torch.zeros(self.N, self.log_T, dtype=torch.long, device=dev)
+        self.g_pow = gamma ** torch.arange(self.log_T, device=dev, dtype=torch.float64)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
@@ -182,6 +189,32 @@ class TrackingSim:
         self.ep_ret[env_ids] = 0.0
         self.start_f[env_ids] = frames
 
+    def _score_bins(self, ids, term, f_end, at_clip_end, ema: float = 0.05, min_remaining: int = 100):
+        """Fold finished episodes into the per-bin completion estimates (see __init__)."""
+        lens = self.ep_step[ids].clamp(max=self.log_T)
+        Tm = int(lens.max())
+        steps = torch.arange(Tm, device=self.device)
+        valid = steps[None, :] < lens[:, None]
+        r = self.ep_r[ids, :Tm].double() * valid
+        gp = self.g_pow[:Tm]
+        rtg = torch.flip(torch.cumsum(torch.flip(r * gp, [1]), 1), [1]) / gp  # R_t = sum_{s>=t} gamma^(s-t) r_s
+        # steps the episode would still have run without failing: to the clip end, capped by the time limit
+        rem_clip = self.motion.clip_end[self.motion.clip_id[f_end]] - f_end
+        n_star = torch.where(term, torch.minimum(lens + rem_clip, torch.full_like(lens, self.max_episode_steps)), lens)
+        m = (n_star[:, None] - steps[None, :]).double()
+        attainable = self.G_max * (1 - self.gamma ** m.clamp(min=0))
+        comp = torch.where(m > 0, rtg / attainable.clamp(min=1e-12), torch.zeros_like(rtg)).clamp(0, 1)
+        truncated = ~term & ~at_clip_end
+        valid = valid & ~(truncated[:, None] & ((lens[:, None] - steps[None, :]) < min_remaining))
+        b = self.ep_b[ids, :Tm][valid]
+        g = comp[valid].float()
+        if b.numel() == 0:
+            return
+        sums = torch.zeros(self.motion.num_bins, device=self.device).index_add_(0, b, g)
+        cnts = torch.zeros(self.motion.num_bins, device=self.device).index_add_(0, b, torch.ones_like(g))
+        hit = cnts > 0
+        self.bin_G[hit] = (1 - ema) * self.bin_G[hit] + ema * sums[hit] / cnts[hit]
+
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:
         S = self.state()
@@ -207,6 +240,10 @@ class TrackingSim:
             "term": term, "done": done, "ep_step": ep_step, "xi": xi, "terms": terms,
         }  # fmt: skip
         # bookkeeping
+        if not self.eval_mode:
+            pos = ep_step.clamp(max=self.log_T - 1)
+            self.ep_r[torch.arange(self.N, device=self.device), pos] = r
+            self.ep_b[torch.arange(self.N, device=self.device), pos] = self.motion.frame_bin[f]
         self.ep_disc_ret += (self.gamma ** ep_step.float()) * r
         self.ep_ret += r
         self.f = f1
@@ -223,17 +260,12 @@ class TrackingSim:
             # bin return estimate; truncated episodes bootstrap with their mean reward
             T = self.ep_step[ids].float()
             if self.sampler == "completion":
-                f_s = self.start_f[ids]
-                L = (self.motion.clip_end[self.motion.clip_id[f_s]] - f_s).float()  # steps available before the clip ends
-                g = self.gamma
-                rest = torch.clamp(L - T, min=0)
-                boot = torch.where(term[ids], 0.0, g**T * (self.ep_ret[ids] / T) * (1 - g**rest) / (1 - g))
-                G = (self.ep_disc_ret[ids] + boot) / (MAX_STEP_REWARD * (1 - g**L) / (1 - g)).clamp(min=1e-6)
+                self._score_bins(ids, term[ids], f1[ids], (f1[ids] >= clip_end[ids]))
             else:
                 boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
                 G = self.ep_disc_ret[ids] + boot
-            b = self.start_bin[ids]
-            self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
+                b = self.start_bin[ids]
+                self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
             self.reset(ids)
