@@ -1,9 +1,9 @@
-# SuperMimic on mjlab
+# SuperMimic Prime (SuperMimic on mjlab)
 
 Unofficial reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable
 World Model* (Liao et al., CoRL 2026, arXiv 2610.28480) on mjlab / MuJoCo-Warp. No official code is
 released. This is a port of [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed)
-(Isaac Lab 3 kit-less, Newton + MuJoCo-Warp; MIT, see `LICENSE.supermimic_vibed`) with the Isaac Lab
+(Isaac Lab 3 kit-less, Newton + MuJoCo-Warp; MIT, see `LICENSE`) with the Isaac Lab
 simulator layer replaced by mjlab. Target: the LAFAN1 controlled comparison (40 G1 clips, 2.45 h, one
 GPU), where the Isaac Lab port reports eval normalized return 0.829 with 0/40 failed clips at 1.47 h.
 
@@ -125,5 +125,5 @@ first LAFAN1 run's contacts.
 ## Credits and license
 
 Code derived from zita-ch/supermimic_vibed (MIT, ETH Zurich, Chong Zhang); the original license is in
-`LICENSE.supermimic_vibed`. Changes in this repository are released under the same MIT terms. The LAFAN1 retargeted
+`LICENSE`. Changes in this repository are released under the same MIT terms. The LAFAN1 retargeted
 clips are CC BY-NC-ND and are not included.
