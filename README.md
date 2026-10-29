@@ -72,6 +72,14 @@ uv run python tools/render.py results/traj.npz results/out.mp4 --clips dance2_su
 Evaluation: all clips, friction 1.0, no randomization or noise, deterministic policy; failure is the training
 termination.
 
+## References
+
+- Paper: [SuperMimic](https://arxiv.org/abs/2610.28480)
+- [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed): Isaac Lab implementation
+- [LaoYang1994/SuperMimic-Rep](https://github.com/LaoYang1994/SuperMimic-Rep): completion reset sampler
+- [Shimingyi/allmimic](https://github.com/Shimingyi/allmimic): cluster-balanced reset prior
+- [mujocolab/mjlab](https://github.com/mujocolab/mjlab): simulator and G1 model
+
 ## License
 
-MIT. Derived from zita-ch/supermimic_vibed (ETH Zurich, Chong Zhang); the original notice is in `LICENSE`.
+MIT, see `LICENSE`.
