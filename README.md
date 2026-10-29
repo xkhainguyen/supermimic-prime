@@ -1,9 +1,20 @@
 # SuperMimic Prime
 
 Unofficial reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*
-(Liao et al., CoRL 2026, arXiv 2610.28480) on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo-Warp. The paper has
-no official code. This is a port of [zita-ch/supermimic_vibed](https://github.com/zita-ch/supermimic_vibed) (Isaac Lab)
-with the simulator layer replaced by mjlab.
+(Liao et al., CoRL 2026, arXiv 2610.28480) on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo-Warp.
+The paper has no official code.
+
+## What this repo adds
+
+- **mjlab backend.** Runs on mjlab's G1 (MJCF, capsule and foot-sphere contacts) with CUDA-graph stepping, no Isaac
+  Lab needed: 222k control steps/s at 4096 envs on an L40S, 2.9 it/s on an H200.
+- **Paper's full BONES-SEED setup.** Name and feasibility filters, 129k-clip packed library with on-demand reference
+  kinematics, chunked evaluation of every clip, and data-parallel training (`torchrun`).
+- **Stabilizers that fix the failures we hit** (below): critic clamp, completion sampler, cluster-balanced reset prior.
+- **World-model diagnostics.** Scripts that compare the learned model against the simulator: Jacobians and
+  finite-difference gradients around touchdown and liftoff (`tools/compare_grads.py`, `tools/smooth_compare.py`,
+  `tools/apg_compare.py`), a frozen-model stress test (`tools/frozen_wm.py`), and drift and subset evaluation
+  (`tools/drift_eval.py`, `tools/eval_subset.py`).
 
 ## Results
 
@@ -30,9 +41,7 @@ Each was added after the paper recipe failed in a logged way. None touches the m
 3. `--bin_prior`, `--softmax_cap` (after Shimingyi/allmimic): per-cluster reset weights (alpha 0.3) and a softmax cap of 50x
    uniform. This took BONES-SEED from hundreds of failures to single digits.
 
-Versus the Isaac Lab port: mjlab's G1 MJCF and contacts (capsules and foot spheres, no URDF hulls) and mjlab's
-tracking-task solver settings (5 ms step x 4, 10 / 20 iterations). `--contact_model legacy` restores the first
-LAFAN1 run's contacts.
+`--contact_model legacy` restores the contacts of our first LAFAN1 run.
 
 ## Setup
 
