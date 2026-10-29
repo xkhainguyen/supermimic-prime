@@ -2,7 +2,7 @@
 
 Unofficial reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with One Differentiable World Model*
 (Liao et al., CoRL 2026, arXiv 2610.28480) on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo-Warp.
-The paper has no official code.
+The paper has not released official code.
 
 ## What this repo adds
 
