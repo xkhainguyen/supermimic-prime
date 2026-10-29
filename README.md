@@ -22,10 +22,12 @@ The paper has no official code.
 |---|---|---|---|---|
 | LAFAN1 (40 clips) | 1 GPU, paper recipe | 0.854 | 0 / 40 | 2.1 h (0.82 at 1.3 h) |
 | BONES-SEED (129k clips) | 1 GPU, paper recipe | 0.931 | 279 | 1.8 h |
-| BONES-SEED | + 3 changes below | 0.944 | 4 | ~6 h |
+| BONES-SEED | + 3 changes below | 0.944 | 4 | ~6 h (19 failed at 3.8 h) |
 
 - **LAFAN1:** matches the paper (0.82 within 1.2 h on an H100). The paper gives no failed-clip count.
-- **BONES-SEED:** the paper reports return above 0.90 with 25 failed clips after 3 h. The 4-failure checkpoint
+- **BONES-SEED, same budget:** at the paper's 3 h we are at 0.93 and ~270 failed (paper: 25); with the changes we reach
+  19 failed at 3.8 h. Our clock includes the evaluation watcher on a shared H200, the paper's does not and uses an H100.
+- **BONES-SEED, best point:** the paper reports return above 0.90 with 25 failed clips after 3 h. The 4-failure checkpoint
   needs the three changes below, takes about twice as long, and is one seed. It is also not stable: after ~7.5 h the
   critic loss rises and failures climb to the thousands. Read 4 as the best point of a run, not a converged result.
 - Flips and rolls fail (about 64 of 66 clips) under every contact model we tried.
