@@ -45,7 +45,8 @@ python tools/prepare_bones.py --src /path/to/bones-seed/g1/csv --out data/bones_
 uv run python tools/test_env.py                                       # FK vs sim, state round-trip, sim throughput
 uv run python supermimic/train.py --log_dir logs/lafan1_main --iterations 20000 --resume auto
 uv run python supermimic/evaluate.py --run_dir logs/lafan1_main --watch   # scores each checkpoint on all clips
-uv run python tools/render.py logs/lafan1_main/ckpt_016000.pt results/out.mp4 --clips dance2_subject1 --seconds 12
+uv run python supermimic/evaluate.py --run_dir logs/lafan1_main --ckpt logs/lafan1_main/ckpt_016000.pt --record results/traj.npz
+uv run python tools/render.py results/traj.npz results/out.mp4 --clips dance2_subject1 --seconds 12
 uv run python tools/plot.py logs/lafan1_main --out results/success_curve.png
 ```
 
