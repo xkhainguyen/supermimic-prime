@@ -4,7 +4,7 @@ Unofficial reproduction of *SuperMimic: Scaling Humanoid Whole-Body Control with
 (Liao et al., CoRL 2026, arXiv 2610.28480) on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo-Warp.
 The paper has not released official code. 
 
-**This is the first complete reproduction of the paper on BONES-SEED and LAFAN1**.
+**This is the first public, complete reproduction of the paper on BONES-SEED and LAFAN1**.
 
 ## What this repo adds
 
